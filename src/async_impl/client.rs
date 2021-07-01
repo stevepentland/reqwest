@@ -1,9 +1,9 @@
 #[cfg(any(feature = "native-tls", feature = "__rustls",))]
 use std::any::Any;
-use std::convert::TryInto;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{collections::HashMap, convert::TryInto, net::SocketAddr};
 use std::{fmt, str};
 
 use bytes::Bytes;
@@ -53,7 +53,7 @@ use crate::{IntoUrl, Method, Proxy, StatusCode, Url};
 /// The `Client` holds a connection pool internally, so it is advised that
 /// you create one and **reuse** it.
 ///
-/// You do **not** have to wrap the `Client` it in an [`Rc`] or [`Arc`] to **reuse** it,
+/// You do **not** have to wrap the `Client` in an [`Rc`] or [`Arc`] to **reuse** it,
 /// because it already uses an [`Arc`] internally.
 ///
 /// [`Rc`]: std::rc::Rc
@@ -62,10 +62,16 @@ pub struct Client {
     inner: Arc<ClientRef>,
 }
 
-/// A `ClientBuilder` can be used to create a `Client` with  custom configuration.
+/// A `ClientBuilder` can be used to create a `Client` with custom configuration.
 #[must_use]
 pub struct ClientBuilder {
     config: Config,
+}
+
+enum HttpVersionPref {
+    Http1,
+    Http2,
+    All,
 }
 
 struct Config {
@@ -94,7 +100,7 @@ struct Config {
     tls_built_in_root_certs: bool,
     #[cfg(feature = "__tls")]
     tls: TlsBackend,
-    http2_only: bool,
+    http_version_pref: HttpVersionPref,
     http1_title_case_headers: bool,
     http2_initial_stream_window_size: Option<u32>,
     http2_initial_connection_window_size: Option<u32>,
@@ -107,6 +113,7 @@ struct Config {
     trust_dns: bool,
     error: Option<crate::Error>,
     https_only: bool,
+    dns_overrides: HashMap<String, SocketAddr>,
 }
 
 impl Default for ClientBuilder {
@@ -152,7 +159,7 @@ impl ClientBuilder {
                 identity: None,
                 #[cfg(feature = "__tls")]
                 tls: TlsBackend::default(),
-                http2_only: false,
+                http_version_pref: HttpVersionPref::All,
                 http1_title_case_headers: false,
                 http2_initial_stream_window_size: None,
                 http2_initial_connection_window_size: None,
@@ -164,6 +171,7 @@ impl ClientBuilder {
                 #[cfg(feature = "cookies")]
                 cookie_store: None,
                 https_only: false,
+                dns_overrides: HashMap::new(),
             },
         }
     }
@@ -172,7 +180,7 @@ impl ClientBuilder {
     ///
     /// # Errors
     ///
-    /// This method fails if TLS backend cannot be initialized, or the resolver
+    /// This method fails if a TLS backend cannot be initialized, or the resolver
     /// cannot load the system configuration.
     pub fn build(self) -> crate::Result<Client> {
         let config = self.config;
@@ -194,9 +202,21 @@ impl ClientBuilder {
             }
 
             let http = match config.trust_dns {
-                false => HttpConnector::new_gai(),
+                false => {
+                    if config.dns_overrides.is_empty() {
+                        HttpConnector::new_gai()
+                    } else {
+                        HttpConnector::new_gai_with_overrides(config.dns_overrides)
+                    }
+                }
                 #[cfg(feature = "trust-dns")]
-                true => HttpConnector::new_trust_dns()?,
+                true => {
+                    if config.dns_overrides.is_empty() {
+                        HttpConnector::new_trust_dns()?
+                    } else {
+                        HttpConnector::new_trust_dns_with_overrides(config.dns_overrides)?
+                    }
+                }
                 #[cfg(not(feature = "trust-dns"))]
                 true => unreachable!("trust-dns shouldn't be enabled unless the feature is"),
             };
@@ -206,6 +226,21 @@ impl ClientBuilder {
                 #[cfg(feature = "default-tls")]
                 TlsBackend::Default => {
                     let mut tls = TlsConnector::builder();
+
+                    #[cfg(feature = "native-tls-alpn")]
+                    {
+                        match config.http_version_pref {
+                            HttpVersionPref::Http1 => {
+                                tls.request_alpns(&["http/1.1"]);
+                            }
+                            HttpVersionPref::Http2 => {
+                                tls.request_alpns(&["h2"]);
+                            }
+                            HttpVersionPref::All => {
+                                tls.request_alpns(&["h2", "http/1.1"]);
+                            }
+                        }
+                    }
 
                     #[cfg(feature = "native-tls")]
                     {
@@ -259,10 +294,16 @@ impl ClientBuilder {
                     use crate::tls::NoVerifier;
 
                     let mut tls = rustls::ClientConfig::new();
-                    if config.http2_only {
-                        tls.set_protocols(&["h2".into()]);
-                    } else {
-                        tls.set_protocols(&["h2".into(), "http/1.1".into()]);
+                    match config.http_version_pref {
+                        HttpVersionPref::Http1 => {
+                            tls.set_protocols(&["http/1.1".into()]);
+                        }
+                        HttpVersionPref::Http2 => {
+                            tls.set_protocols(&["h2".into()]);
+                        }
+                        HttpVersionPref::All => {
+                            tls.set_protocols(&["h2".into(), "http/1.1".into()]);
+                        }
                     }
                     #[cfg(feature = "rustls-tls-webpki-roots")]
                     if config.tls_built_in_root_certs {
@@ -313,7 +354,7 @@ impl ClientBuilder {
         connector.set_verbose(config.connection_verbose);
 
         let mut builder = hyper::Client::builder();
-        if config.http2_only {
+        if matches!(config.http_version_pref, HttpVersionPref::Http2) {
             builder.http2_only(true);
         }
 
@@ -497,8 +538,8 @@ impl ClientBuilder {
     /// - When sending a request and if the request's headers do not already contain
     ///   an `Accept-Encoding` **and** `Range` values, the `Accept-Encoding` header is set to `gzip`.
     ///   The request body is **not** automatically compressed.
-    /// - When receiving a response, if it's headers contain a `Content-Encoding` value that
-    ///   equals to `gzip`, both values `Content-Encoding` and `Content-Length` are removed from the
+    /// - When receiving a response, if its headers contain a `Content-Encoding` value of
+    ///   `gzip`, both `Content-Encoding` and `Content-Length` are removed from the
     ///   headers' set. The response body is automatically decompressed.
     ///
     /// If the `gzip` feature is turned on, the default option is enabled.
@@ -520,8 +561,8 @@ impl ClientBuilder {
     /// - When sending a request and if the request's headers do not already contain
     ///   an `Accept-Encoding` **and** `Range` values, the `Accept-Encoding` header is set to `br`.
     ///   The request body is **not** automatically compressed.
-    /// - When receiving a response, if it's headers contain a `Content-Encoding` value that
-    ///   equals to `br`, both values `Content-Encoding` and `Content-Length` are removed from the
+    /// - When receiving a response, if its headers contain a `Content-Encoding` value of
+    ///   `br`, both `Content-Encoding` and `Content-Length` are removed from the
     ///   headers' set. The response body is automatically decompressed.
     ///
     /// If the `brotli` feature is turned on, the default option is enabled.
@@ -533,6 +574,29 @@ impl ClientBuilder {
     #[cfg_attr(docsrs, doc(cfg(feature = "brotli")))]
     pub fn brotli(mut self, enable: bool) -> ClientBuilder {
         self.config.accepts.brotli = enable;
+        self
+    }
+
+    /// Enable auto deflate decompression by checking the `Content-Encoding` response header.
+    ///
+    /// If auto deflate decompression is turned on:
+    ///
+    /// - When sending a request and if the request's headers do not already contain
+    ///   an `Accept-Encoding` **and** `Range` values, the `Accept-Encoding` header is set to `deflate`.
+    ///   The request body is **not** automatically compressed.
+    /// - When receiving a response, if it's headers contain a `Content-Encoding` value that
+    ///   equals to `deflate`, both values `Content-Encoding` and `Content-Length` are removed from the
+    ///   headers' set. The response body is automatically decompressed.
+    ///
+    /// If the `deflate` feature is turned on, the default option is enabled.
+    ///
+    /// # Optional
+    ///
+    /// This requires the optional `deflate` feature to be enabled
+    #[cfg(feature = "deflate")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "deflate")))]
+    pub fn deflate(mut self, enable: bool) -> ClientBuilder {
+        self.config.accepts.deflate = enable;
         self
     }
 
@@ -565,6 +629,23 @@ impl ClientBuilder {
         }
 
         #[cfg(not(feature = "brotli"))]
+        {
+            self
+        }
+    }
+
+    /// Disable auto response body deflate decompression.
+    ///
+    /// This method exists even if the optional `deflate` feature is not enabled.
+    /// This can be used to ensure a `Client` doesn't use deflate decompression
+    /// even if another dependency were to enable the optional `deflate` feature.
+    pub fn no_deflate(self) -> ClientBuilder {
+        #[cfg(feature = "deflate")]
+        {
+            self.deflate(false)
+        }
+
+        #[cfg(not(feature = "deflate"))]
         {
             self
         }
@@ -668,15 +749,21 @@ impl ClientBuilder {
         self
     }
 
-    /// Enable case sensitive headers.
+    /// Send headers as title case instead of lowercase.
     pub fn http1_title_case_headers(mut self) -> ClientBuilder {
         self.config.http1_title_case_headers = true;
         self
     }
 
+    /// Only use HTTP/1.
+    pub fn http1_only(mut self) -> ClientBuilder {
+        self.config.http_version_pref = HttpVersionPref::Http1;
+        self
+    }
+
     /// Only use HTTP/2.
     pub fn http2_prior_knowledge(mut self) -> ClientBuilder {
-        self.config.http2_only = true;
+        self.config.http_version_pref = HttpVersionPref::Http2;
         self
     }
 
@@ -988,6 +1075,19 @@ impl ClientBuilder {
         self.config.https_only = enabled;
         self
     }
+
+    /// Override DNS resolution for specific domains to particular IP addresses.
+    ///
+    /// Warning
+    ///
+    /// Since the DNS protocol has no notion of ports, if you wish to send
+    /// traffic to a particular port you must include this port in the URL
+    /// itself, any port in the overridden addr will be ignored and traffic sent
+    /// to the conventional port for the given scheme (e.g. 80 for http).
+    pub fn resolve(mut self, domain: &str, addr: SocketAddr) -> ClientBuilder {
+        self.config.dns_overrides.insert(domain.to_string(), addr);
+        self
+    }
 }
 
 type HyperClient = hyper::Client<Connector, super::body::ImplStream>;
@@ -1003,7 +1103,7 @@ impl Client {
     ///
     /// # Panics
     ///
-    /// This method panics if TLS backend cannot initialized, or the resolver
+    /// This method panics if a TLS backend cannot initialized, or the resolver
     /// cannot load the system configuration.
     ///
     /// Use `Client::builder()` if you wish to handle the failure as an `Error`
@@ -1023,7 +1123,7 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// This method fails whenever supplied `Url` cannot be parsed.
+    /// This method fails whenever the supplied `Url` cannot be parsed.
     pub fn get<U: IntoUrl>(&self, url: U) -> RequestBuilder {
         self.request(Method::GET, url)
     }
@@ -1032,7 +1132,7 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// This method fails whenever supplied `Url` cannot be parsed.
+    /// This method fails whenever the supplied `Url` cannot be parsed.
     pub fn post<U: IntoUrl>(&self, url: U) -> RequestBuilder {
         self.request(Method::POST, url)
     }
@@ -1041,7 +1141,7 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// This method fails whenever supplied `Url` cannot be parsed.
+    /// This method fails whenever the supplied `Url` cannot be parsed.
     pub fn put<U: IntoUrl>(&self, url: U) -> RequestBuilder {
         self.request(Method::PUT, url)
     }
@@ -1050,7 +1150,7 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// This method fails whenever supplied `Url` cannot be parsed.
+    /// This method fails whenever the supplied `Url` cannot be parsed.
     pub fn patch<U: IntoUrl>(&self, url: U) -> RequestBuilder {
         self.request(Method::PATCH, url)
     }
@@ -1059,7 +1159,7 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// This method fails whenever supplied `Url` cannot be parsed.
+    /// This method fails whenever the supplied `Url` cannot be parsed.
     pub fn delete<U: IntoUrl>(&self, url: U) -> RequestBuilder {
         self.request(Method::DELETE, url)
     }
@@ -1068,7 +1168,7 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// This method fails whenever supplied `Url` cannot be parsed.
+    /// This method fails whenever the supplied `Url` cannot be parsed.
     pub fn head<U: IntoUrl>(&self, url: U) -> RequestBuilder {
         self.request(Method::HEAD, url)
     }
@@ -1076,11 +1176,11 @@ impl Client {
     /// Start building a `Request` with the `Method` and `Url`.
     ///
     /// Returns a `RequestBuilder`, which will allow setting headers and
-    /// request body before sending.
+    /// the request body before sending.
     ///
     /// # Errors
     ///
-    /// This method fails whenever supplied `Url` cannot be parsed.
+    /// This method fails whenever the supplied `Url` cannot be parsed.
     pub fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder {
         let req = url.into_url().map(move |url| Request::new(method, url));
         RequestBuilder::new(self.clone(), req)
@@ -1263,7 +1363,11 @@ impl Config {
             f.field("http1_title_case_headers", &true);
         }
 
-        if self.http2_only {
+        if matches!(self.http_version_pref, HttpVersionPref::Http1) {
+            f.field("http1_only", &true);
+        }
+
+        if matches!(self.http_version_pref, HttpVersionPref::Http2) {
             f.field("http2_prior_knowledge", &true);
         }
 
@@ -1300,6 +1404,10 @@ impl Config {
         #[cfg(all(feature = "native-tls-crate", feature = "__rustls"))]
         {
             f.field("tls_backend", &self.tls);
+        }
+
+        if !self.dns_overrides.is_empty() {
+            f.field("dns_overrides", &self.dns_overrides);
         }
     }
 }
