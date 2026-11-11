@@ -3,15 +3,23 @@ use std::borrow::Cow;
 use std::fmt;
 use std::pin::Pin;
 
+#[cfg(feature = "stream")]
+use std::io;
+#[cfg(feature = "stream")]
+use std::path::Path;
+
 use bytes::Bytes;
-use http::HeaderMap;
 use mime_guess::Mime;
 use percent_encoding::{self, AsciiSet, NON_ALPHANUMERIC};
+#[cfg(feature = "stream")]
+use tokio::fs::File;
 
 use futures_core::Stream;
 use futures_util::{future, stream, StreamExt};
+use http_body_util::BodyExt;
 
 use super::Body;
+use crate::header::HeaderMap;
 
 /// An async multipart/form-data request.
 pub struct Form {
@@ -82,6 +90,33 @@ impl Form {
         self.part(name, Part::text(value))
     }
 
+    /// Adds a file field.
+    ///
+    /// The path will be used to try to guess the filename and mime.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn run() -> std::io::Result<()> {
+    /// let form = reqwest::multipart::Form::new()
+    ///     .file("key", "/path/to/file").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Errors when the file cannot be opened.
+    #[cfg(feature = "stream")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "stream")))]
+    pub async fn file<T, U>(self, name: T, path: U) -> io::Result<Form>
+    where
+        T: Into<Cow<'static, str>>,
+        U: AsRef<Path>,
+    {
+        Ok(self.part(name, Part::file(path).await?))
+    }
+
     /// Adds a customized Part.
     pub fn part<T>(self, name: T, part: Part) -> Form
     where
@@ -106,9 +141,21 @@ impl Form {
     }
 
     /// Consume this instance and transform into an instance of Body for use in a request.
-    pub(crate) fn stream(mut self) -> Body {
+    pub(crate) fn stream(self) -> Body {
         if self.inner.fields.is_empty() {
             return Body::empty();
+        }
+
+        Body::stream(self.into_stream())
+    }
+
+    /// Produce a stream of the bytes in this `Form`, consuming it.
+    pub fn into_stream(mut self) -> impl Stream<Item = Result<Bytes, crate::Error>> + Send + Sync {
+        if self.inner.fields.is_empty() {
+            let empty_stream: Pin<
+                Box<dyn Stream<Item = Result<Bytes, crate::Error>> + Send + Sync>,
+            > = Box::pin(futures_util::stream::empty());
+            return empty_stream;
         }
 
         // create initial part to init reduce chain
@@ -127,7 +174,7 @@ impl Form {
         let last = stream::once(future::ready(Ok(
             format!("--{}--\r\n", self.boundary()).into()
         )));
-        Body::stream(stream.chain(last))
+        Box::pin(stream.chain(last))
     }
 
     /// Generate a hyper::Body stream for a single Part instance of a Form request.
@@ -155,7 +202,7 @@ impl Form {
         // then append form data followed by terminating CRLF
         boundary
             .chain(header)
-            .chain(part.value.into_stream())
+            .chain(part.value.into_data_stream())
             .chain(stream::once(future::ready(Ok("\r\n".into()))))
     }
 
@@ -218,6 +265,35 @@ impl Part {
         Part::new(value.into(), Some(length))
     }
 
+    /// Makes a file parameter.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the file cannot be opened.
+    #[cfg(feature = "stream")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "stream")))]
+    pub async fn file<T: AsRef<Path>>(path: T) -> io::Result<Part> {
+        let path = path.as_ref();
+        let file_name = path
+            .file_name()
+            .map(|filename| filename.to_string_lossy().into_owned());
+        let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+        let mime = mime_guess::from_ext(ext).first_or_octet_stream();
+        let file = File::open(path).await?;
+        let len = file.metadata().await.map(|m| m.len()).ok();
+        let field = match len {
+            Some(len) => Part::stream_with_length(file, len),
+            None => Part::stream(file),
+        }
+        .mime(mime);
+
+        Ok(if let Some(file_name) = file_name {
+            field.file_name(file_name)
+        } else {
+            field
+        })
+    }
+
     fn new(value: Body, body_length: Option<u64>) -> Part {
         Part {
             meta: PartMetadata::new(),
@@ -242,6 +318,11 @@ impl Part {
         T: Into<Cow<'static, str>>,
     {
         self.with_inner(move |inner| inner.file_name(filename))
+    }
+
+    /// Sets custom headers for the part.
+    pub fn headers(self, headers: HeaderMap) -> Part {
+        self.with_inner(move |inner| inner.headers(headers))
     }
 
     fn with_inner<F>(self, func: F) -> Self
@@ -322,7 +403,7 @@ impl<P: PartProps> FormParts<P> {
     }
 
     // If predictable, computes the length the request will have
-    // The length should be preditable if only String and file fields have been added,
+    // The length should be predictable if only String and file fields have been added,
     // but not if a generic reader has been added;
     pub(crate) fn compute_length(&mut self) -> Option<u64> {
         let mut length = 0u64;
@@ -349,7 +430,7 @@ impl<P: PartProps> FormParts<P> {
                 _ => return None,
             }
         }
-        // If there is a at least one field there is a special boundary for the very last field.
+        // If there is at least one field there is a special boundary for the very last field.
         if !self.fields.is_empty() {
             length += 2 + self.boundary().len() as u64 + 4
         }
@@ -392,6 +473,14 @@ impl PartMetadata {
         T: Into<Cow<'static, str>>,
     {
         self.file_name = Some(filename.into());
+        self
+    }
+
+    pub(crate) fn headers<T>(mut self, headers: T) -> Self
+    where
+        T: Into<HeaderMap>,
+    {
+        self.headers = headers.into();
         self
     }
 }
@@ -444,57 +533,57 @@ pub(crate) enum PercentEncoding {
 
 impl PercentEncoding {
     pub(crate) fn encode_headers(&self, name: &str, field: &PartMetadata) -> Vec<u8> {
-        let s = format!(
-            "Content-Disposition: form-data; {}{}{}",
-            self.format_parameter("name", name),
-            match field.file_name {
-                Some(ref file_name) => format!("; {}", self.format_filename(file_name)),
-                None => String::new(),
-            },
-            match field.mime {
-                Some(ref mime) => format!("\r\nContent-Type: {}", mime),
-                None => "".to_string(),
-            },
-        );
-        field
-            .headers
-            .iter()
-            .fold(s.into_bytes(), |mut header, (k, v)| {
-                header.extend_from_slice(b"\r\n");
-                header.extend_from_slice(k.as_str().as_bytes());
-                header.extend_from_slice(b": ");
-                header.extend_from_slice(v.as_bytes());
-                header
-            })
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"Content-Disposition: form-data; ");
+
+        match self.percent_encode(name) {
+            Cow::Borrowed(value) => {
+                // nothing has been percent encoded
+                buf.extend_from_slice(b"name=\"");
+                buf.extend_from_slice(value.as_bytes());
+                buf.extend_from_slice(b"\"");
+            }
+            Cow::Owned(value) => {
+                // something has been percent encoded
+                buf.extend_from_slice(b"name*=utf-8''");
+                buf.extend_from_slice(value.as_bytes());
+            }
+        }
+
+        // According to RFC7578 Section 4.2, `filename*=` syntax is invalid.
+        // See https://github.com/seanmonstar/reqwest/issues/419.
+        if let Some(filename) = &field.file_name {
+            buf.extend_from_slice(b"; filename=\"");
+            let legal_filename = filename
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\r', "\\\r")
+                .replace('\n', "\\\n");
+            buf.extend_from_slice(legal_filename.as_bytes());
+            buf.extend_from_slice(b"\"");
+        }
+
+        if let Some(mime) = &field.mime {
+            buf.extend_from_slice(b"\r\nContent-Type: ");
+            buf.extend_from_slice(mime.as_ref().as_bytes());
+        }
+
+        for (k, v) in field.headers.iter() {
+            buf.extend_from_slice(b"\r\n");
+            buf.extend_from_slice(k.as_str().as_bytes());
+            buf.extend_from_slice(b": ");
+            buf.extend_from_slice(v.as_bytes());
+        }
+        buf
     }
 
-    // According to RFC7578 Section 4.2, `filename*=` syntax is invalid.
-    // See https://github.com/seanmonstar/reqwest/issues/419.
-    fn format_filename(&self, filename: &str) -> String {
-        let legal_filename = filename
-            .replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\r", "\\\r")
-            .replace("\n", "\\\n");
-        format!("filename=\"{}\"", legal_filename)
-    }
+    fn percent_encode<'a>(&self, value: &'a str) -> Cow<'a, str> {
+        use percent_encoding::utf8_percent_encode as percent_encode;
 
-    fn format_parameter(&self, name: &str, value: &str) -> String {
-        let legal_value = match *self {
-            PercentEncoding::PathSegment => {
-                percent_encoding::utf8_percent_encode(value, PATH_SEGMENT_ENCODE_SET).to_string()
-            }
-            PercentEncoding::AttrChar => {
-                percent_encoding::utf8_percent_encode(value, ATTR_CHAR_ENCODE_SET).to_string()
-            }
-            PercentEncoding::NoOp => value.to_string(),
-        };
-        if value.len() == legal_value.len() {
-            // nothing has been percent encoded
-            format!("{}=\"{}\"", name, value)
-        } else {
-            // something has been percent encoded
-            format!("{}*=utf-8''{}", name, legal_value)
+        match self {
+            Self::PathSegment => percent_encode(value, PATH_SEGMENT_ENCODE_SET).into(),
+            Self::AttrChar => percent_encode(value, ATTR_CHAR_ENCODE_SET).into(),
+            Self::NoOp => value.into(),
         }
     }
 }
@@ -507,14 +596,15 @@ fn gen_boundary() -> String {
     let c = random();
     let d = random();
 
-    format!("{:016x}-{:016x}-{:016x}-{:016x}", a, b, c, d)
+    format!("{a:016x}-{b:016x}-{c:016x}-{d:016x}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::stream;
     use futures_util::TryStreamExt;
-    use futures_util::{future, stream};
+    use std::future;
     use tokio::{self, runtime};
 
     #[test]
@@ -525,7 +615,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("new rt");
-        let body = form.stream().into_stream();
+        let body = form.stream().into_data_stream();
         let s = body.map_ok(|try_c| try_c.to_vec()).try_concat();
 
         let out = rt.block_on(s);
@@ -544,7 +634,10 @@ mod tests {
                 ))))),
             )
             .part("key1", Part::text("value1"))
-            .part("key2", Part::text("value2").mime(mime::IMAGE_BMP))
+            .part(
+                "key2",
+                Part::text("value2").mime(mime_guess::mime::IMAGE_BMP),
+            )
             .part(
                 "reader2",
                 Part::stream(Body::stream(stream::once(future::ready::<
@@ -575,7 +668,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("new rt");
-        let body = form.stream().into_stream();
+        let body = form.stream().into_data_stream();
         let s = body.map(|try_c| try_c.map(|r| r.to_vec())).try_concat();
 
         let out = rt.block_on(s).unwrap();
@@ -584,14 +677,16 @@ mod tests {
             "START REAL\n{}\nEND REAL",
             std::str::from_utf8(&out).unwrap()
         );
-        println!("START EXPECTED\n{}\nEND EXPECTED", expected);
+        println!("START EXPECTED\n{expected}\nEND EXPECTED");
         assert_eq!(std::str::from_utf8(&out).unwrap(), expected);
     }
 
     #[test]
     fn stream_to_end_with_header() {
-        let mut part = Part::text("value2").mime(mime::IMAGE_BMP);
-        part.meta.headers.insert("Hdr3", "/a/b/c".parse().unwrap());
+        let mut part = Part::text("value2").mime(mime_guess::mime::IMAGE_BMP);
+        let mut headers = HeaderMap::new();
+        headers.insert("Hdr3", "/a/b/c".parse().unwrap());
+        part = part.headers(headers);
         let mut form = Form::new().part("key2", part);
         form.inner.boundary = "boundary".to_string();
         let expected = "--boundary\r\n\
@@ -605,7 +700,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("new rt");
-        let body = form.stream().into_stream();
+        let body = form.stream().into_data_stream();
         let s = body.map(|try_c| try_c.map(|r| r.to_vec())).try_concat();
 
         let out = rt.block_on(s).unwrap();
@@ -614,7 +709,7 @@ mod tests {
             "START REAL\n{}\nEND REAL",
             std::str::from_utf8(&out).unwrap()
         );
-        println!("START EXPECTED\n{}\nEND EXPECTED", expected);
+        println!("START EXPECTED\n{expected}\nEND EXPECTED");
         assert_eq!(std::str::from_utf8(&out).unwrap(), expected);
     }
 

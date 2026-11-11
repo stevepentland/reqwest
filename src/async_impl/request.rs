@@ -1,10 +1,9 @@
 use std::convert::TryFrom;
 use std::fmt;
 use std::future::Future;
-use std::io::Write;
 use std::time::Duration;
 
-use base64::write::EncoderWriter as Base64Encoder;
+#[cfg(any(feature = "query", feature = "form", feature = "json"))]
 use serde::Serialize;
 #[cfg(feature = "json")]
 use serde_json;
@@ -14,11 +13,14 @@ use super::client::{Client, Pending};
 #[cfg(feature = "multipart")]
 use super::multipart;
 use super::response::Response;
+use crate::config::{RequestConfig, TotalTimeout};
 #[cfg(feature = "multipart")]
 use crate::header::CONTENT_LENGTH;
-use crate::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
+#[cfg(any(feature = "multipart", feature = "form", feature = "json"))]
+use crate::header::CONTENT_TYPE;
+use crate::header::{HeaderMap, HeaderName, HeaderValue};
 use crate::{Method, Url};
-use http::{request::Parts, Request as HttpRequest, Version};
+use http::{request::Parts, Extensions, Request as HttpRequest, Version};
 
 /// A request which can be executed with `Client::execute()`.
 pub struct Request {
@@ -26,8 +28,8 @@ pub struct Request {
     url: Url,
     headers: HeaderMap,
     body: Option<Body>,
-    timeout: Option<Duration>,
     version: Version,
+    extensions: Extensions,
 }
 
 /// A builder to construct the properties of a `Request`.
@@ -48,8 +50,8 @@ impl Request {
             url,
             headers: HeaderMap::new(),
             body: None,
-            timeout: None,
             version: Version::default(),
+            extensions: Extensions::new(),
         }
     }
 
@@ -101,16 +103,28 @@ impl Request {
         &mut self.body
     }
 
+    /// Get the extensions.
+    #[inline]
+    pub(crate) fn extensions(&self) -> &Extensions {
+        &self.extensions
+    }
+
+    /// Get a mutable reference to the extensions.
+    #[inline]
+    pub(crate) fn extensions_mut(&mut self) -> &mut Extensions {
+        &mut self.extensions
+    }
+
     /// Get the timeout.
     #[inline]
     pub fn timeout(&self) -> Option<&Duration> {
-        self.timeout.as_ref()
+        RequestConfig::<TotalTimeout>::get(&self.extensions)
     }
 
     /// Get a mutable reference to the timeout.
     #[inline]
     pub fn timeout_mut(&mut self) -> &mut Option<Duration> {
-        &mut self.timeout
+        RequestConfig::<TotalTimeout>::get_mut(&mut self.extensions)
     }
 
     /// Get the http version.
@@ -134,30 +148,22 @@ impl Request {
             None => None,
         };
         let mut req = Request::new(self.method().clone(), self.url().clone());
-        *req.timeout_mut() = self.timeout().cloned();
+        *req.timeout_mut() = self.timeout().copied();
         *req.headers_mut() = self.headers().clone();
         *req.version_mut() = self.version();
+        *req.extensions_mut() = self.extensions().clone();
         req.body = body;
         Some(req)
     }
 
-    pub(super) fn pieces(
-        self,
-    ) -> (
-        Method,
-        Url,
-        HeaderMap,
-        Option<Body>,
-        Option<Duration>,
-        Version,
-    ) {
+    pub(super) fn pieces(self) -> (Method, Url, HeaderMap, Option<Body>, Version, Extensions) {
         (
             self.method,
             self.url,
             self.headers,
             self.body,
-            self.timeout,
             self.version,
+            self.extensions,
         )
     }
 }
@@ -179,6 +185,14 @@ impl RequestBuilder {
         }
     }
 
+    /// Assemble a builder starting from an existing `Client` and a `Request`.
+    pub fn from_parts(client: Client, request: Request) -> RequestBuilder {
+        RequestBuilder {
+            client,
+            request: crate::Result::Ok(request),
+        }
+    }
+
     /// Add a `Header` to this Request.
     pub fn header<K, V>(self, key: K, value: V) -> RequestBuilder
     where
@@ -190,7 +204,7 @@ impl RequestBuilder {
         self.header_sensitive(key, value, false)
     }
 
-    /// Add a `Header` to this Request with ability to define if header_value is sensitive.
+    /// Add a `Header` to this Request with ability to define if `header_value` is sensitive.
     fn header_sensitive<K, V>(mut self, key: K, value: V, sensitive: bool) -> RequestBuilder
     where
         HeaderName: TryFrom<K>,
@@ -203,7 +217,12 @@ impl RequestBuilder {
             match <HeaderName as TryFrom<K>>::try_from(key) {
                 Ok(key) => match <HeaderValue as TryFrom<V>>::try_from(value) {
                     Ok(mut value) => {
-                        value.set_sensitive(sensitive);
+                        // We want to potentially make an non-sensitive header
+                        // to be sensitive, not the reverse. So, don't turn off
+                        // a previously sensitive header.
+                        if sensitive {
+                            value.set_sensitive(true);
+                        }
                         req.headers_mut().append(key, value);
                     }
                     Err(e) => error = Some(crate::error::builder(e.into())),
@@ -228,21 +247,25 @@ impl RequestBuilder {
     }
 
     /// Enable HTTP basic authentication.
+    ///
+    /// ```rust
+    /// # use reqwest::Error;
+    ///
+    /// # async fn run() -> Result<(), Error> {
+    /// let client = reqwest::Client::new();
+    /// let resp = client.delete("http://httpbin.org/delete")
+    ///     .basic_auth("admin", Some("good password"))
+    ///     .send()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn basic_auth<U, P>(self, username: U, password: Option<P>) -> RequestBuilder
     where
         U: fmt::Display,
         P: fmt::Display,
     {
-        let mut header_value = b"Basic ".to_vec();
-        {
-            let mut encoder = Base64Encoder::new(&mut header_value, base64::STANDARD);
-            // The unwraps here are fine because Vec::write* is infallible.
-            write!(encoder, "{}:", username).unwrap();
-            if let Some(password) = password {
-                write!(encoder, "{}", password).unwrap();
-            }
-        }
-
+        let header_value = crate::util::basic_auth(username, password);
         self.header_sensitive(crate::header::AUTHORIZATION, header_value, true)
     }
 
@@ -251,7 +274,7 @@ impl RequestBuilder {
     where
         T: fmt::Display,
     {
-        let header_value = format!("Bearer {}", token);
+        let header_value = format!("Bearer {token}");
         self.header_sensitive(crate::header::AUTHORIZATION, header_value, true)
     }
 
@@ -294,6 +317,9 @@ impl RequestBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// In additional the request's body, the Content-Type and Content-Length fields are
+    /// appropriately set.
     #[cfg(feature = "multipart")]
     #[cfg_attr(docsrs, doc(cfg(feature = "multipart")))]
     pub fn multipart(self, mut multipart: multipart::Form) -> RequestBuilder {
@@ -320,7 +346,7 @@ impl RequestBuilder {
     /// be called multiple times and that existing query parameters are not
     /// overwritten if the same key is used. The key will simply show up
     /// twice in the query string.
-    /// Calling `.query([("foo", "a"), ("foo", "b")])` gives `"foo=a&foo=b"`.
+    /// Calling `.query(&[("foo", "a"), ("foo", "b")])` gives `"foo=a&foo=b"`.
     ///
     /// # Note
     /// This method does not support serializing a single key-value
@@ -328,9 +354,15 @@ impl RequestBuilder {
     /// as `.query(&[("key", "val")])`. It's also possible to serialize structs
     /// and maps into a key-value pair.
     ///
+    /// # Optional
+    ///
+    /// This requires the optional `query` feature to be enabled.
+    ///
     /// # Errors
     /// This method will fail if the object you provide cannot be serialized
     /// into a query string.
+    #[cfg(feature = "query")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "query")))]
     pub fn query<T: Serialize + ?Sized>(mut self, query: &T) -> RequestBuilder {
         let mut error = None;
         if let Ok(ref mut req) = self.request {
@@ -362,15 +394,48 @@ impl RequestBuilder {
     }
 
     /// Send a form body.
+    ///
+    /// Sets the body to the url encoded serialization of the passed value,
+    /// and also sets the `Content-Type: application/x-www-form-urlencoded`
+    /// header.
+    ///
+    /// ```rust
+    /// # use reqwest::Error;
+    /// # use std::collections::HashMap;
+    /// #
+    /// # async fn run() -> Result<(), Error> {
+    /// let mut params = HashMap::new();
+    /// params.insert("lang", "rust");
+    ///
+    /// let client = reqwest::Client::new();
+    /// let res = client.post("http://httpbin.org")
+    ///     .form(&params)
+    ///     .send()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Optional
+    ///
+    /// This requires the optional `form` feature to be enabled.
+    ///
+    /// # Errors
+    ///
+    /// This method fails if the passed value cannot be serialized into
+    /// url encoded format
+    #[cfg(feature = "form")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "form")))]
     pub fn form<T: Serialize + ?Sized>(mut self, form: &T) -> RequestBuilder {
         let mut error = None;
         if let Ok(ref mut req) = self.request {
             match serde_urlencoded::to_string(form) {
                 Ok(body) => {
-                    req.headers_mut().insert(
-                        CONTENT_TYPE,
-                        HeaderValue::from_static("application/x-www-form-urlencoded"),
-                    );
+                    req.headers_mut()
+                        .entry(CONTENT_TYPE)
+                        .or_insert(HeaderValue::from_static(
+                            "application/x-www-form-urlencoded",
+                        ));
                     *req.body_mut() = Some(body.into());
                 }
                 Err(err) => error = Some(crate::error::builder(err)),
@@ -383,6 +448,10 @@ impl RequestBuilder {
     }
 
     /// Send a JSON body.
+    ///
+    /// Serializes the value to JSON and sets resulting bytes as the body.
+    ///
+    /// Sets Content-Type header to application/json unless the header is already set.
     ///
     /// # Optional
     ///
@@ -400,7 +469,8 @@ impl RequestBuilder {
             match serde_json::to_vec(json) {
                 Ok(body) => {
                     req.headers_mut()
-                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                        .entry(CONTENT_TYPE)
+                        .or_insert_with(|| HeaderValue::from_static("application/json"));
                     *req.body_mut() = Some(body.into());
                 }
                 Err(err) => error = Some(crate::error::builder(err)),
@@ -412,23 +482,19 @@ impl RequestBuilder {
         self
     }
 
-    /// Disable CORS on fetching the request.
-    ///
-    /// # WASM
-    ///
-    /// This option is only effective with WebAssembly target.
-    ///
-    /// The [request mode][mdn] will be set to 'no-cors'.
-    ///
-    /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/API/Request/mode
-    pub fn fetch_mode_no_cors(self) -> RequestBuilder {
-        self
-    }
-
     /// Build a `Request`, which can be inspected, modified and executed with
     /// `Client::execute()`.
     pub fn build(self) -> crate::Result<Request> {
         self.request
+    }
+
+    /// Build a `Request`, which can be inspected, modified and executed with
+    /// `Client::execute()`.
+    ///
+    /// This is similar to [`RequestBuilder::build()`], but also returns the
+    /// embedded `Client`.
+    pub fn build_split(self) -> (Client, crate::Result<Request>) {
+        (self.client, self.request)
     }
 
     /// Constructs the Request and sends it to the target URL, returning a
@@ -556,6 +622,7 @@ where
             uri,
             headers,
             version,
+            extensions,
             ..
         } = parts;
         let url = Url::parse(&uri.to_string()).map_err(crate::error::builder)?;
@@ -564,8 +631,8 @@ where
             url,
             headers,
             body: Some(body.into()),
-            timeout: None,
             version,
+            extensions,
         })
     }
 }
@@ -580,6 +647,7 @@ impl TryFrom<Request> for HttpRequest<Body> {
             headers,
             body,
             version,
+            extensions,
             ..
         } = req;
 
@@ -591,19 +659,21 @@ impl TryFrom<Request> for HttpRequest<Body> {
             .map_err(crate::error::builder)?;
 
         *req.headers_mut() = headers;
+        *req.extensions_mut() = extensions;
         Ok(req)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, HttpRequest, Request, Version};
-    use crate::Method;
-    use serde::Serialize;
+    #![cfg(not(feature = "rustls-no-provider"))]
+
+    use super::*;
+    #[cfg(feature = "query")]
     use std::collections::BTreeMap;
-    use std::convert::TryFrom;
 
     #[test]
+    #[cfg(feature = "query")]
     fn add_query_append() {
         let client = Client::new();
         let some_url = "https://google.com/";
@@ -617,6 +687,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "query")]
     fn add_query_append_same() {
         let client = Client::new();
         let some_url = "https://google.com/";
@@ -629,6 +700,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "query")]
     fn add_query_struct() {
         #[derive(Serialize)]
         struct Params {
@@ -652,6 +724,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "query")]
     fn add_query_map() {
         let mut params = BTreeMap::new();
         params.insert("foo", "bar");
@@ -693,6 +766,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "query")]
     fn normalize_empty_query() {
         let client = Client::new();
         let some_url = "https://google.com/";
@@ -802,6 +876,25 @@ mod tests {
     }
 
     #[test]
+    fn test_explicit_sensitive_header() {
+        let client = Client::new();
+        let some_url = "https://localhost/";
+
+        let mut header = http::HeaderValue::from_static("in plain sight");
+        header.set_sensitive(true);
+
+        let req = client
+            .get(some_url)
+            .header("hiding", header)
+            .build()
+            .expect("request build");
+
+        assert_eq!(req.url().as_str(), "https://localhost/");
+        assert_eq!(req.headers()["hiding"], "in plain sight");
+        assert!(req.headers()["hiding"].is_sensitive());
+    }
+
+    #[test]
     fn convert_from_http_request() {
         let http_request = HttpRequest::builder()
             .method("GET")
@@ -837,6 +930,18 @@ mod tests {
         assert_eq!(req.method(), Method::GET);
         assert_eq!(req.url().as_str(), "http://localhost/");
         assert_eq!(req.version(), Version::HTTP_11);
+    }
+
+    #[test]
+    fn builder_split_reassemble() {
+        let builder = {
+            let client = Client::new();
+            client.get("http://example.com")
+        };
+        let (client, inner) = builder.build_split();
+        let request = inner.unwrap();
+        let builder = RequestBuilder::from_parts(client, request);
+        builder.build().unwrap();
     }
 
     /*
